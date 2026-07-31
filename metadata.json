@@ -1,0 +1,13 @@
+{
+  "name": "Lockscreen Control",
+  "description": "Customise the lock screen: blur the background, add a personal message, keep the screen unblanked, and collapse notifications behind a toggle.",
+  "uuid": "lockscreen-control@jvjacq.com",
+  "version": 1,
+  "settings-schema": "org.gnome.shell.extensions.lockscreen-control",
+  "session-modes": ["unlock-dialog"],
+  "shell-version": ["45", "46", "47", "48", "49", "50"],
+  "url": "https://github.com/jvjacq/lockscreen-control",
+  "donations": {
+    "buymeacoffee": "jvjacq"
+  }
+}

@@ -1,0 +1,80 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <schema id="org.gnome.shell.extensions.lockscreen-control"
+          path="/org/gnome/shell/extensions/lockscreen-control/">
+
+    <!-- Notifications -->
+    <key name="notifications-collapse" type="b">
+      <default>true</default>
+      <summary>Collapse notifications</summary>
+      <description>Hide notifications behind a toggle button on the lock screen</description>
+    </key>
+
+    <!-- Unblank -->
+    <key name="unblank-enabled" type="b">
+      <default>true</default>
+      <summary>Keep screen unblanked</summary>
+      <description>Prevent the lock screen from dimming or blanking the display</description>
+    </key>
+    <key name="unblank-ac-only" type="b">
+      <default>true</default>
+      <summary>Only unblank on AC power</summary>
+      <description>Only keep the screen unblanked when plugged in to AC power</description>
+    </key>
+    <key name="unblank-timeout" type="i">
+      <default>0</default>
+      <summary>Blank after (minutes)</summary>
+      <description>Re-allow blanking after this many minutes. 0 means never re-blank.</description>
+    </key>
+
+    <!-- Background blur -->
+    <key name="blur-enabled" type="b">
+      <default>true</default>
+      <summary>Blur background</summary>
+      <description>Apply a blur effect to the lock screen wallpaper</description>
+    </key>
+    <key name="blur-sigma" type="i">
+      <range min="1" max="100"/>
+      <default>30</default>
+      <summary>Blur radius</summary>
+      <description>Gaussian blur sigma value. Higher values create more blur.</description>
+    </key>
+
+    <!-- Brightness overlay -->
+    <key name="brightness-enabled" type="b">
+      <default>true</default>
+      <summary>Dim background</summary>
+      <description>Apply a dark overlay on the lock screen background</description>
+    </key>
+    <key name="brightness-level" type="d">
+      <range min="0.0" max="1.0"/>
+      <default>0.6</default>
+      <summary>Brightness level</summary>
+      <description>0.0 = fully black overlay, 1.0 = no overlay</description>
+    </key>
+
+    <!-- Custom message -->
+    <key name="message-enabled" type="b">
+      <default>false</default>
+      <summary>Show custom message</summary>
+      <description>Display a custom text message on the lock screen</description>
+    </key>
+    <key name="message-text" type="s">
+      <default>''</default>
+      <summary>Message text</summary>
+      <description>The text to display on the lock screen</description>
+    </key>
+    <key name="message-size" type="i">
+      <range min="8" max="72"/>
+      <default>20</default>
+      <summary>Message font size</summary>
+      <description>Font size of the custom message in pixels</description>
+    </key>
+    <key name="message-color" type="s">
+      <default>'#ffffff'</default>
+      <summary>Message color</summary>
+      <description>Hex color of the custom message text</description>
+    </key>
+
+  </schema>
+</schemalist>
