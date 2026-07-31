@@ -6,6 +6,9 @@ import Shell from 'gi://Shell';
 import { Extension } from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 
+// How often (seconds) to call SimulateUserActivity to prevent screen blank
+const UNBLANK_INTERVAL = 30;
+
 export default class LockscreenControl extends Extension {
     enable() {
         this._settings = this.getSettings();
@@ -13,11 +16,12 @@ export default class LockscreenControl extends Extension {
         this._dialogSetup = false;
         this._collapsed = true;
         this._retryId = null;
-        this._inhibitCookie = null;
-        this._inhibitTimeoutId = null;
+        this._unblankIntervalId = null;
+        this._unblankTimeoutId = null;
         this._blurEffect = null;
         this._dimOverlay = null;
         this._messageLabel = null;
+        this._inAuthMode = false;
 
         // reactive:false - stage.grab(dialog) routes all lock-screen input to dialog;
         // clicks on this button are intercepted via the dialog 'event' listener below.
@@ -71,25 +75,19 @@ export default class LockscreenControl extends Extension {
             this._teardownLockScreen();
             this._dialog = dialog;
             this._collapsed = true;
+            this._inAuthMode = false;
             this._toggleButton.label = 'Notifications  ▶';
             this._setupLockScreen();
         }
 
-        this._syncNotifBox();
-        this._positionButton();
-        global.stage.set_child_above_sibling(this._toggleButton, null);
-
-        if (this._settings.get_boolean('notifications-collapse'))
-            this._toggleButton.show();
-        else
-            this._toggleButton.hide();
+        this._syncOverlayVisibility();
     }
 
     _setupLockScreen() {
         const monitor = Main.layoutManager.primaryMonitor;
         const bgGroup = Main.screenShield?._backgroundGroup;
 
-        // Blur: apply directly to the background actor group so only the wallpaper is blurred
+        // Blur: applied directly to the background group so only the wallpaper is blurred
         if (bgGroup) {
             this._blurEffect = new Shell.BlurEffect({
                 mode: Shell.BlurMode.ACTOR,
@@ -97,7 +95,6 @@ export default class LockscreenControl extends Extension {
             });
             bgGroup.add_effect(this._blurEffect);
 
-            // Dim overlay inside the background group so it sits below the dialog
             if (monitor) {
                 this._dimOverlay = new St.Widget({
                     reactive: false,
@@ -114,14 +111,29 @@ export default class LockscreenControl extends Extension {
         this._syncBlur();
         this._syncDim();
 
-        // Custom message label
+        // Custom message: full monitor width so text-align:center works correctly
         if (monitor) {
-            this._messageLabel = new St.Label({ reactive: false, can_focus: false });
+            this._messageLabel = new St.Label({
+                reactive: false,
+                can_focus: false,
+                width: monitor.width,
+                x: monitor.x,
+            });
             global.stage.add_child(this._messageLabel);
             this._syncMessage();
         }
 
-        // Notification collapse: listen for clicks via the dialog event handler
+        // Detect when the auth prompt (password entry) becomes active and hide our UI
+        const authPrompt = this._dialog._authPrompt;
+        if (authPrompt) {
+            authPrompt.connectObject('notify::visible', () => {
+                this._inAuthMode = authPrompt.visible;
+                this._syncOverlayVisibility();
+            }, this);
+            this._inAuthMode = authPrompt.visible;
+        }
+
+        // Notification collapse: intercept clicks via the dialog event handler
         const notifBox = this._dialog._notificationsBox;
         if (notifBox && !this._dialogSetup) {
             this._dialogSetup = true;
@@ -142,7 +154,39 @@ export default class LockscreenControl extends Extension {
             }, this);
         }
 
+        this._syncOverlayVisibility();
         this._setupUnblank();
+    }
+
+    _syncOverlayVisibility() {
+        const showOverlay = !this._inAuthMode;
+        const monitor = Main.layoutManager.primaryMonitor;
+
+        if (showOverlay && this._settings.get_boolean('notifications-collapse')) {
+            this._positionButton();
+            global.stage.set_child_above_sibling(this._toggleButton, null);
+            this._toggleButton.show();
+        } else {
+            this._toggleButton.hide();
+        }
+
+        // When entering auth mode, force notifications visible so the layout doesn't shift
+        if (this._inAuthMode) {
+            const notifBox = this._dialog?._notificationsBox;
+            if (notifBox) {
+                notifBox.opacity = 255;
+                notifBox.reactive = true;
+            }
+        } else {
+            this._syncNotifBox();
+        }
+
+        if (this._messageLabel) {
+            if (showOverlay && this._settings.get_boolean('message-enabled'))
+                this._messageLabel.show();
+            else
+                this._messageLabel.hide();
+        }
     }
 
     _setupUnblank() {
@@ -151,60 +195,56 @@ export default class LockscreenControl extends Extension {
         if (this._settings.get_boolean('unblank-ac-only') && !this._isOnAC())
             return;
 
-        try {
-            const result = Gio.DBus.session.call_sync(
-                'org.gnome.SessionManager',
-                '/org/gnome/SessionManager',
-                'org.gnome.SessionManager',
-                'Inhibit',
-                new GLib.Variant('(susu)', [
-                    this.uuid,
-                    0,
-                    'Keep lock screen unblanked',
-                    8,
-                ]),
-                new GLib.VariantType('(u)'),
-                Gio.DBusCallFlags.NONE,
-                -1,
-                null
-            );
-            this._inhibitCookie = result.get_child_value(0).get_uint32();
-        } catch (_e) {
-            // Power management inhibit unavailable
-        }
+        const simulate = () => {
+            try {
+                Gio.DBus.session.call_sync(
+                    'org.gnome.ScreenSaver',
+                    '/org/gnome/ScreenSaver',
+                    'org.gnome.ScreenSaver',
+                    'SimulateUserActivity',
+                    null,
+                    null,
+                    Gio.DBusCallFlags.NONE,
+                    -1,
+                    null
+                );
+            } catch (_e) {
+                // ScreenSaver D-Bus not available
+            }
+            return GLib.SOURCE_CONTINUE;
+        };
+
+        // Call once immediately, then every 30 seconds
+        simulate();
+        this._unblankIntervalId = GLib.timeout_add_seconds(
+            GLib.PRIORITY_DEFAULT,
+            UNBLANK_INTERVAL,
+            simulate
+        );
 
         const minutes = this._settings.get_int('unblank-timeout');
         if (minutes > 0) {
-            this._inhibitTimeoutId = GLib.timeout_add_seconds(
+            this._unblankTimeoutId = GLib.timeout_add_seconds(
                 GLib.PRIORITY_DEFAULT,
                 minutes * 60,
                 () => {
-                    this._inhibitTimeoutId = null;
-                    this._uninhibit();
+                    this._unblankTimeoutId = null;
+                    this._stopUnblank();
                     return GLib.SOURCE_REMOVE;
                 }
             );
         }
     }
 
-    _uninhibit() {
-        if (this._inhibitCookie === null) return;
-        try {
-            Gio.DBus.session.call_sync(
-                'org.gnome.SessionManager',
-                '/org/gnome/SessionManager',
-                'org.gnome.SessionManager',
-                'Uninhibit',
-                new GLib.Variant('(u)', [this._inhibitCookie]),
-                null,
-                Gio.DBusCallFlags.NONE,
-                -1,
-                null
-            );
-        } catch (_e) {
-            // Failed to uninhibit
+    _stopUnblank() {
+        if (this._unblankIntervalId) {
+            GLib.source_remove(this._unblankIntervalId);
+            this._unblankIntervalId = null;
         }
-        this._inhibitCookie = null;
+        if (this._unblankTimeoutId) {
+            GLib.source_remove(this._unblankTimeoutId);
+            this._unblankTimeoutId = null;
+        }
     }
 
     _isOnAC() {
@@ -240,32 +280,30 @@ export default class LockscreenControl extends Extension {
             return;
         }
         const level = this._settings.get_double('brightness-level');
-        const alpha = (1.0 - level).toFixed(2);
-        this._dimOverlay.set_style(`background-color: rgba(0,0,0,${alpha});`);
+        this._dimOverlay.set_style(`background-color: rgba(0,0,0,${(1.0 - level).toFixed(2)});`);
     }
 
     _syncMessage() {
         if (!this._messageLabel) return;
-        if (!this._settings.get_boolean('message-enabled')) {
-            this._messageLabel.hide();
-            return;
-        }
         const text = this._settings.get_string('message-text');
         const size = this._settings.get_int('message-size');
         const color = this._settings.get_string('message-color');
         this._messageLabel.set_text(text);
-        this._messageLabel.set_style(`font-size: ${size}px; color: ${color};`);
-
+        // Full-width label with centered text, positioned just below the date
+        this._messageLabel.set_style(
+            `font-size: ${size}px; color: ${color}; text-align: center;`
+        );
         const monitor = Main.layoutManager.primaryMonitor;
         if (monitor) {
-            // Position below the lock screen clock (approx 57% down)
+            // The lock screen clock/date sits around 43-46% of screen height.
+            // Place the message just below, at ~48%.
             this._messageLabel.set_position(
-                monitor.x + Math.floor((monitor.width - this._messageLabel.width) / 2),
-                monitor.y + Math.floor(monitor.height * 0.57)
+                monitor.x,
+                monitor.y + Math.floor(monitor.height * 0.48)
             );
         }
         global.stage.set_child_above_sibling(this._messageLabel, null);
-        this._messageLabel.show();
+        this._syncOverlayVisibility();
     }
 
     _syncNotifBox() {
@@ -290,6 +328,7 @@ export default class LockscreenControl extends Extension {
 
     _teardownLockScreen() {
         this._dialog?.disconnectObject(this);
+        this._dialog?._authPrompt?.disconnectObject(this);
         this._dialogSetup = false;
 
         const notifBox = this._dialog?._notificationsBox;
@@ -316,13 +355,9 @@ export default class LockscreenControl extends Extension {
             this._messageLabel = null;
         }
 
-        if (this._inhibitTimeoutId) {
-            GLib.source_remove(this._inhibitTimeoutId);
-            this._inhibitTimeoutId = null;
-        }
-        this._uninhibit();
-
+        this._stopUnblank();
         this._dialog = null;
+        this._inAuthMode = false;
     }
 
     disable() {
