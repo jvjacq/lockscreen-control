@@ -122,27 +122,19 @@ export default class LockscreenControl extends Extension {
             this._syncMessage();
         }
 
-        // Poll every 300ms to detect when auth prompt appears/disappears.
-        // This avoids depending on private method names that may vary by GNOME version.
+        // Poll as a fallback for auth entry (e.g. fingerprint auth that has no keypress).
+        // Exit detection is handled by _resetLockScreen patch, which fires at the exact
+        // right moment. The poll only handles entry here to avoid double-scheduling on exit.
         this._inAuthMode = this._detectAuthMode();
         this._authPollId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 300, () => {
             const nowInAuth = this._detectAuthMode();
             if (nowInAuth && !this._inAuthMode) {
-                // Entering auth: hide our UI immediately
                 if (this._idleShowId) {
                     GLib.source_remove(this._idleShowId);
                     this._idleShowId = null;
                 }
                 this._inAuthMode = true;
                 this._syncOverlayVisibility();
-            } else if (!nowInAuth && this._inAuthMode && !this._idleShowId) {
-                // Exiting auth: delay before showing so GNOME's exit animation finishes
-                this._idleShowId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 300, () => {
-                    this._idleShowId = null;
-                    this._inAuthMode = false;
-                    this._syncOverlayVisibility();
-                    return GLib.SOURCE_REMOVE;
-                });
             }
             return GLib.SOURCE_CONTINUE;
         });
@@ -168,17 +160,18 @@ export default class LockscreenControl extends Extension {
                     }
                 }
 
-                // Any click or keypress not on the toggle starts auth — hide immediately
-                // before GNOME's entering animation begins.
-                if (!this._inAuthMode &&
-                    (type === Clutter.EventType.BUTTON_PRESS ||
-                     type === Clutter.EventType.KEY_PRESS)) {
+                if (type === Clutter.EventType.BUTTON_PRESS ||
+                    type === Clutter.EventType.KEY_PRESS) {
+                    // Cancel any pending show timer on every input — even when already in
+                    // auth mode, so a click during the 300ms exit delay can't race through.
                     if (this._idleShowId) {
                         GLib.source_remove(this._idleShowId);
                         this._idleShowId = null;
                     }
-                    this._inAuthMode = true;
-                    this._syncOverlayVisibility();
+                    if (!this._inAuthMode) {
+                        this._inAuthMode = true;
+                        this._syncOverlayVisibility();
+                    }
                 }
 
                 return Clutter.EVENT_PROPAGATE;
@@ -203,8 +196,6 @@ export default class LockscreenControl extends Extension {
         return false;
     }
 
-    // Patch Main.screenShield methods to prevent lock screen blanking.
-    // Auth mode detection is handled entirely by the poll — no auth logic here.
     _patchShield() {
         const shield = Main.screenShield;
         const self = this;
@@ -212,9 +203,7 @@ export default class LockscreenControl extends Extension {
         const doUnblank = this._settings.get_boolean('unblank-enabled') &&
                           (!this._settings.get_boolean('unblank-ac-only') || this._isOnAC());
 
-        if (!doUnblank) return;
-
-        if (typeof shield._activateFade === 'function') {
+        if (doUnblank && typeof shield._activateFade === 'function') {
             this._origActivateFade = shield._activateFade.bind(shield);
             shield._activateFade = function (lightbox, time) {
                 // Skip the fade entirely when locked so the screen stays lit
@@ -236,24 +225,42 @@ export default class LockscreenControl extends Extension {
             };
         }
 
+        // Always patch _resetLockScreen: GNOME calls this when returning to idle after
+        // auth (ESC or failed attempt). Use it for event-driven exit detection so our
+        // show timer is scheduled at the exact right moment rather than at a poll boundary.
         if (typeof shield._resetLockScreen === 'function') {
             this._origResetLockScreen = shield._resetLockScreen.bind(shield);
             shield._resetLockScreen = function (params) {
-                self._origResetLockScreen.call(this, Object.assign({}, params, { fadeToBlack: false }));
+                if (self._inAuthMode) {
+                    if (self._idleShowId)
+                        GLib.source_remove(self._idleShowId);
+                    self._idleShowId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 300, () => {
+                        self._idleShowId = null;
+                        self._inAuthMode = false;
+                        self._syncOverlayVisibility();
+                        return GLib.SOURCE_REMOVE;
+                    });
+                }
+                const patchedParams = doUnblank
+                    ? Object.assign({}, params, { fadeToBlack: false })
+                    : params;
+                self._origResetLockScreen.call(this, patchedParams);
             };
         }
 
-        const minutes = this._settings.get_int('unblank-timeout');
-        if (minutes > 0) {
-            this._unblankTimeoutId = GLib.timeout_add_seconds(
-                GLib.PRIORITY_DEFAULT,
-                minutes * 60,
-                () => {
-                    this._unblankTimeoutId = null;
-                    this._unpatchActivateFade();
-                    return GLib.SOURCE_REMOVE;
-                }
-            );
+        if (doUnblank) {
+            const minutes = this._settings.get_int('unblank-timeout');
+            if (minutes > 0) {
+                this._unblankTimeoutId = GLib.timeout_add_seconds(
+                    GLib.PRIORITY_DEFAULT,
+                    minutes * 60,
+                    () => {
+                        this._unblankTimeoutId = null;
+                        this._unpatchActivateFade();
+                        return GLib.SOURCE_REMOVE;
+                    }
+                );
+            }
         }
     }
 
