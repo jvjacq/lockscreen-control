@@ -137,7 +137,7 @@ export default class LockscreenControl extends Extension {
                 this._syncOverlayVisibility();
             } else if (!nowInAuth && this._inAuthMode && !this._idleShowId) {
                 // Exiting auth: delay before showing so GNOME's exit animation finishes
-                this._idleShowId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 600, () => {
+                this._idleShowId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 300, () => {
                     this._idleShowId = null;
                     this._inAuthMode = false;
                     this._syncOverlayVisibility();
@@ -147,23 +147,40 @@ export default class LockscreenControl extends Extension {
             return GLib.SOURCE_CONTINUE;
         });
 
-        // Notification collapse
-        const notifBox = this._dialog._notificationsBox;
-        if (notifBox && !this._dialogSetup) {
+        // Single dialog event handler: handle toggle clicks AND detect auth start.
+        // The 'event' signal fires synchronously on every input to the dialog, so
+        // hiding here happens before GNOME even starts its auth animation.
+        if (!this._dialogSetup) {
             this._dialogSetup = true;
             this._dialog.connectObject('event', (_actor, event) => {
-                if (event.type() !== Clutter.EventType.BUTTON_PRESS)
-                    return Clutter.EVENT_PROPAGATE;
-                const [ex, ey] = event.get_coords();
-                const [bx, by] = this._toggleButton.get_transformed_position();
-                const [bw, bh] = this._toggleButton.get_size();
-                if (ex >= bx && ex <= bx + bw && ey >= by && ey <= by + bh) {
-                    this._collapsed = !this._collapsed;
-                    this._toggleButton.label = this._collapsed
-                        ? 'Notifications  ▶' : 'Notifications  ▼';
-                    this._syncNotifBox();
-                    return Clutter.EVENT_STOP;
+                const type = event.type();
+
+                if (type === Clutter.EventType.BUTTON_PRESS) {
+                    const [ex, ey] = event.get_coords();
+                    const [bx, by] = this._toggleButton.get_transformed_position();
+                    const [bw, bh] = this._toggleButton.get_size();
+                    if (ex >= bx && ex <= bx + bw && ey >= by && ey <= by + bh) {
+                        this._collapsed = !this._collapsed;
+                        this._toggleButton.label = this._collapsed
+                            ? 'Notifications  ▶' : 'Notifications  ▼';
+                        this._syncNotifBox();
+                        return Clutter.EVENT_STOP;
+                    }
                 }
+
+                // Any click or keypress not on the toggle starts auth — hide immediately
+                // before GNOME's entering animation begins.
+                if (!this._inAuthMode &&
+                    (type === Clutter.EventType.BUTTON_PRESS ||
+                     type === Clutter.EventType.KEY_PRESS)) {
+                    if (this._idleShowId) {
+                        GLib.source_remove(this._idleShowId);
+                        this._idleShowId = null;
+                    }
+                    this._inAuthMode = true;
+                    this._syncOverlayVisibility();
+                }
+
                 return Clutter.EVENT_PROPAGATE;
             }, this);
         }
