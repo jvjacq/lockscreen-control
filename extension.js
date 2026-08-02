@@ -268,15 +268,8 @@ export default class LockscreenControl extends Extension {
             this._toggleButton.hide();
         }
 
-        if (this._inAuthMode) {
-            const notifBox = this._dialog?._notificationsBox;
-            if (notifBox) {
-                notifBox.opacity = 255;
-                notifBox.reactive = true;
-            }
-        } else {
-            this._syncNotifBox();
-        }
+        // Always hide notifications during auth so the password screen stays clean
+        this._syncNotifBox();
 
         if (this._messageLabel) {
             if (showOverlay && this._settings.get_boolean('message-enabled'))
@@ -320,11 +313,18 @@ export default class LockscreenControl extends Extension {
     }
 
     _syncNotifBox() {
-        if (!this._settings.get_boolean('notifications-collapse')) return;
         const notifBox = this._dialog?._notificationsBox;
         if (!notifBox) return;
-        notifBox.opacity = this._collapsed ? 0 : 255;
-        notifBox.reactive = !this._collapsed;
+        if (!this._settings.get_boolean('notifications-collapse')) {
+            // Feature disabled: show notifications normally unless in auth mode
+            notifBox.opacity = this._inAuthMode ? 0 : 255;
+            notifBox.reactive = !this._inAuthMode;
+            return;
+        }
+        // Collapsed or in auth: hide. Expanded and idle: show.
+        const hide = this._collapsed || this._inAuthMode;
+        notifBox.opacity = hide ? 0 : 255;
+        notifBox.reactive = !hide;
     }
 
     _positionButton() {
