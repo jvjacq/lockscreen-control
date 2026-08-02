@@ -1,13 +1,11 @@
 import GLib from 'gi://GLib';
 import Gio from 'gi://Gio';
+import Pango from 'gi://Pango';
 import St from 'gi://St';
 import Clutter from 'gi://Clutter';
 import Shell from 'gi://Shell';
 import { Extension } from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
-
-// How often (seconds) to call SimulateUserActivity to prevent screen blank
-const UNBLANK_INTERVAL = 30;
 
 export default class LockscreenControl extends Extension {
     enable() {
@@ -16,15 +14,18 @@ export default class LockscreenControl extends Extension {
         this._dialogSetup = false;
         this._collapsed = true;
         this._retryId = null;
-        this._unblankIntervalId = null;
-        this._unblankTimeoutId = null;
         this._blurEffect = null;
         this._dimOverlay = null;
         this._messageLabel = null;
         this._inAuthMode = false;
+        this._fadeDismissId = null;
+        this._unblankTimeoutId = null;
+        this._origActivateFade = null;
+        this._origResetLockScreen = null;
+        this._origWakeUpScreen = null;
 
         // reactive:false - stage.grab(dialog) routes all lock-screen input to dialog;
-        // clicks on this button are intercepted via the dialog 'event' listener below.
+        // clicks are intercepted via the dialog 'event' listener below.
         this._toggleButton = new St.Button({
             label: 'Notifications  ▶',
             reactive: false,
@@ -111,27 +112,17 @@ export default class LockscreenControl extends Extension {
         this._syncBlur();
         this._syncDim();
 
-        // Custom message: full monitor width so text-align:center works correctly
+        // Custom message: use Pango centering so text centers within the full-screen width
         if (monitor) {
-            this._messageLabel = new St.Label({
-                reactive: false,
-                can_focus: false,
-                width: monitor.width,
-                x: monitor.x,
-            });
+            this._messageLabel = new St.Label({ reactive: false, can_focus: false });
+            this._messageLabel.clutter_text.set_line_alignment(Pango.Alignment.CENTER);
             global.stage.add_child(this._messageLabel);
             this._syncMessage();
         }
 
-        // Detect when the auth prompt (password entry) becomes active and hide our UI
-        const authPrompt = this._dialog._authPrompt;
-        if (authPrompt) {
-            authPrompt.connectObject('notify::visible', () => {
-                this._inAuthMode = authPrompt.visible;
-                this._syncOverlayVisibility();
-            }, this);
-            this._inAuthMode = authPrompt.visible;
-        }
+        // Detect auth mode via wakeUpScreen / _resetLockScreen patches on dialog and shield
+        this._patchDialogWakeUp();
+        this._patchShield();
 
         // Notification collapse: intercept clicks via the dialog event handler
         const notifBox = this._dialog._notificationsBox;
@@ -155,95 +146,81 @@ export default class LockscreenControl extends Extension {
         }
 
         this._syncOverlayVisibility();
-        this._setupUnblank();
     }
 
-    _syncOverlayVisibility() {
-        const showOverlay = !this._inAuthMode;
-        const monitor = Main.layoutManager.primaryMonitor;
+    // Patch dialog.wakeUpScreen to detect when the user activates auth mode
+    _patchDialogWakeUp() {
+        if (!this._dialog || typeof this._dialog.wakeUpScreen !== 'function') return;
+        this._origWakeUpScreen = this._dialog.wakeUpScreen.bind(this._dialog);
+        const self = this;
+        this._dialog.wakeUpScreen = function () {
+            self._inAuthMode = true;
+            self._syncOverlayVisibility();
+            self._origWakeUpScreen();
+        };
+    }
 
-        if (showOverlay && this._settings.get_boolean('notifications-collapse')) {
-            this._positionButton();
-            global.stage.set_child_above_sibling(this._toggleButton, null);
-            this._toggleButton.show();
-        } else {
-            this._toggleButton.hide();
-        }
+    // Patch shield._resetLockScreen to detect when auth mode ends (back to idle)
+    // and, when unblank is enabled, to skip the fade-to-black.
+    _patchShield() {
+        const shield = Main.screenShield;
+        const doUnblank = this._settings.get_boolean('unblank-enabled') &&
+                          (!this._settings.get_boolean('unblank-ac-only') || this._isOnAC());
 
-        // When entering auth mode, force notifications visible so the layout doesn't shift
-        if (this._inAuthMode) {
-            const notifBox = this._dialog?._notificationsBox;
-            if (notifBox) {
-                notifBox.opacity = 255;
-                notifBox.reactive = true;
-            }
-        } else {
-            this._syncNotifBox();
-        }
-
-        if (this._messageLabel) {
-            if (showOverlay && this._settings.get_boolean('message-enabled'))
-                this._messageLabel.show();
+        // Always patch _resetLockScreen so we can detect auth-mode reset
+        this._origResetLockScreen = shield._resetLockScreen.bind(shield);
+        const self = this;
+        shield._resetLockScreen = function (params) {
+            self._inAuthMode = false;
+            self._syncOverlayVisibility();
+            if (doUnblank)
+                self._origResetLockScreen.call(this, Object.assign({}, params, { fadeToBlack: false }));
             else
-                this._messageLabel.hide();
-        }
-    }
-
-    _setupUnblank() {
-        if (!this._settings.get_boolean('unblank-enabled'))
-            return;
-        if (this._settings.get_boolean('unblank-ac-only') && !this._isOnAC())
-            return;
-
-        const simulate = () => {
-            try {
-                Gio.DBus.session.call_sync(
-                    'org.gnome.ScreenSaver',
-                    '/org/gnome/ScreenSaver',
-                    'org.gnome.ScreenSaver',
-                    'SimulateUserActivity',
-                    null,
-                    null,
-                    Gio.DBusCallFlags.NONE,
-                    -1,
-                    null
-                );
-            } catch (_e) {
-                // ScreenSaver D-Bus not available
-            }
-            return GLib.SOURCE_CONTINUE;
+                self._origResetLockScreen.call(this, params);
         };
 
-        // Call once immediately, then every 30 seconds
-        simulate();
-        this._unblankIntervalId = GLib.timeout_add_seconds(
-            GLib.PRIORITY_DEFAULT,
-            UNBLANK_INTERVAL,
-            simulate
-        );
+        if (!doUnblank) return;
 
+        // Patch _activateFade: turn the lightbox on briefly then off to prevent blanking
+        this._origActivateFade = shield._activateFade.bind(shield);
+        shield._activateFade = function (lightbox, time) {
+            if (self._fadeDismissId) {
+                GLib.source_remove(self._fadeDismissId);
+                self._fadeDismissId = null;
+            }
+            Main.uiGroup.set_child_above_sibling(lightbox, null);
+            lightbox.lightOn(time);
+            self._fadeDismissId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, time + 500, () => {
+                lightbox.lightOff();
+                self._fadeDismissId = null;
+                return GLib.SOURCE_REMOVE;
+            });
+            if (this._becameActiveId === 0) {
+                this._becameActiveId = this.idleMonitor.add_user_active_watch(
+                    this._onUserBecameActive.bind(this)
+                );
+            }
+        };
+
+        // Optional re-blank timeout
         const minutes = this._settings.get_int('unblank-timeout');
         if (minutes > 0) {
-            this._unblankTimeoutId = GLib.timeout_add_seconds(
-                GLib.PRIORITY_DEFAULT,
-                minutes * 60,
-                () => {
-                    this._unblankTimeoutId = null;
-                    this._stopUnblank();
-                    return GLib.SOURCE_REMOVE;
-                }
-            );
+            this._unblankTimeoutId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, minutes * 60, () => {
+                this._unblankTimeoutId = null;
+                this._unpatchActivateFade();
+                return GLib.SOURCE_REMOVE;
+            });
         }
     }
 
-    _stopUnblank() {
-        if (this._unblankIntervalId) {
-            GLib.source_remove(this._unblankIntervalId);
-            this._unblankIntervalId = null;
+    _unpatchActivateFade() {
+        if (this._fadeDismissId) {
+            GLib.source_remove(this._fadeDismissId);
+            this._fadeDismissId = null;
         }
-        if (this._unblankTimeoutId) {
-            GLib.source_remove(this._unblankTimeoutId);
-            this._unblankTimeoutId = null;
+        if (this._origActivateFade) {
+            Main.screenShield._activateFade = this._origActivateFade;
+            this._origActivateFade = null;
         }
     }
 
@@ -263,6 +240,36 @@ export default class LockscreenControl extends Extension {
             return !result.get_child_value(0).unpack().get_boolean();
         } catch (_e) {
             return true;
+        }
+    }
+
+    _syncOverlayVisibility() {
+        const showOverlay = !this._inAuthMode;
+
+        if (showOverlay && this._settings.get_boolean('notifications-collapse')) {
+            this._positionButton();
+            global.stage.set_child_above_sibling(this._toggleButton, null);
+            this._toggleButton.show();
+        } else {
+            this._toggleButton.hide();
+        }
+
+        // When entering auth mode, restore notifications so layout stays intact
+        if (this._inAuthMode) {
+            const notifBox = this._dialog?._notificationsBox;
+            if (notifBox) {
+                notifBox.opacity = 255;
+                notifBox.reactive = true;
+            }
+        } else {
+            this._syncNotifBox();
+        }
+
+        if (this._messageLabel) {
+            if (showOverlay && this._settings.get_boolean('message-enabled'))
+                this._messageLabel.show();
+            else
+                this._messageLabel.hide();
         }
     }
 
@@ -289,14 +296,12 @@ export default class LockscreenControl extends Extension {
         const size = this._settings.get_int('message-size');
         const color = this._settings.get_string('message-color');
         this._messageLabel.set_text(text);
-        // Full-width label with centered text, positioned just below the date
-        this._messageLabel.set_style(
-            `font-size: ${size}px; color: ${color}; text-align: center;`
-        );
+        this._messageLabel.set_style(`font-size: ${size}px; color: ${color};`);
         const monitor = Main.layoutManager.primaryMonitor;
         if (monitor) {
-            // The lock screen clock/date sits around 43-46% of screen height.
-            // Place the message just below, at ~48%.
+            // Force full monitor width so Pango centering applies across the whole screen
+            this._messageLabel.set_width(monitor.width);
+            // Place just below the date (~48% down matches the lock screen clock/date group)
             this._messageLabel.set_position(
                 monitor.x,
                 monitor.y + Math.floor(monitor.height * 0.48)
@@ -327,8 +332,25 @@ export default class LockscreenControl extends Extension {
     }
 
     _teardownLockScreen() {
+        // Restore dialog.wakeUpScreen
+        if (this._origWakeUpScreen && this._dialog) {
+            this._dialog.wakeUpScreen = this._origWakeUpScreen;
+            this._origWakeUpScreen = null;
+        }
+
+        // Restore shield patches
+        if (this._origResetLockScreen) {
+            Main.screenShield._resetLockScreen = this._origResetLockScreen;
+            this._origResetLockScreen = null;
+        }
+        this._unpatchActivateFade();
+
+        if (this._unblankTimeoutId) {
+            GLib.source_remove(this._unblankTimeoutId);
+            this._unblankTimeoutId = null;
+        }
+
         this._dialog?.disconnectObject(this);
-        this._dialog?._authPrompt?.disconnectObject(this);
         this._dialogSetup = false;
 
         const notifBox = this._dialog?._notificationsBox;
@@ -355,7 +377,6 @@ export default class LockscreenControl extends Extension {
             this._messageLabel = null;
         }
 
-        this._stopUnblank();
         this._dialog = null;
         this._inAuthMode = false;
     }
