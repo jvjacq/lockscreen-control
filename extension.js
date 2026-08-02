@@ -1,6 +1,5 @@
 import GLib from 'gi://GLib';
 import Gio from 'gi://Gio';
-import Pango from 'gi://Pango';
 import St from 'gi://St';
 import Clutter from 'gi://Clutter';
 import Shell from 'gi://Shell';
@@ -14,6 +13,7 @@ export default class LockscreenControl extends Extension {
         this._dialogSetup = false;
         this._collapsed = true;
         this._retryId = null;
+        this._authPollId = null;
         this._blurEffect = null;
         this._dimOverlay = null;
         this._messageLabel = null;
@@ -22,10 +22,7 @@ export default class LockscreenControl extends Extension {
         this._unblankTimeoutId = null;
         this._origActivateFade = null;
         this._origResetLockScreen = null;
-        this._origWakeUpScreen = null;
 
-        // reactive:false - stage.grab(dialog) routes all lock-screen input to dialog;
-        // clicks are intercepted via the dialog 'event' listener below.
         this._toggleButton = new St.Button({
             label: 'Notifications  ▶',
             reactive: false,
@@ -88,7 +85,6 @@ export default class LockscreenControl extends Extension {
         const monitor = Main.layoutManager.primaryMonitor;
         const bgGroup = Main.screenShield?._backgroundGroup;
 
-        // Blur: applied directly to the background group so only the wallpaper is blurred
         if (bgGroup) {
             this._blurEffect = new Shell.BlurEffect({
                 mode: Shell.BlurMode.ACTOR,
@@ -112,19 +108,32 @@ export default class LockscreenControl extends Extension {
         this._syncBlur();
         this._syncDim();
 
-        // Custom message: use Pango centering so text centers within the full-screen width
         if (monitor) {
             this._messageLabel = new St.Label({ reactive: false, can_focus: false });
-            this._messageLabel.clutter_text.set_line_alignment(Pango.Alignment.CENTER);
+            // AlignConstraint centers the actor on the x-axis relative to the stage,
+            // correctly accounting for the actor's actual rendered width.
+            this._messageLabel.add_constraint(new Clutter.AlignConstraint({
+                source: global.stage,
+                align_axis: Clutter.AlignAxis.X_AXIS,
+                factor: 0.5,
+            }));
             global.stage.add_child(this._messageLabel);
             this._syncMessage();
         }
 
-        // Detect auth mode via wakeUpScreen / _resetLockScreen patches on dialog and shield
-        this._patchDialogWakeUp();
-        this._patchShield();
+        // Poll every 300ms to detect when auth prompt appears/disappears.
+        // This avoids depending on private method names that may vary by GNOME version.
+        this._inAuthMode = this._detectAuthMode();
+        this._authPollId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 300, () => {
+            const nowInAuth = this._detectAuthMode();
+            if (nowInAuth !== this._inAuthMode) {
+                this._inAuthMode = nowInAuth;
+                this._syncOverlayVisibility();
+            }
+            return GLib.SOURCE_CONTINUE;
+        });
 
-        // Notification collapse: intercept clicks via the dialog event handler
+        // Notification collapse
         const notifBox = this._dialog._notificationsBox;
         if (notifBox && !this._dialogSetup) {
             this._dialogSetup = true;
@@ -145,79 +154,84 @@ export default class LockscreenControl extends Extension {
             }, this);
         }
 
+        this._patchShield();
         this._syncOverlayVisibility();
     }
 
-    // Patch dialog.wakeUpScreen to detect when the user activates auth mode
-    _patchDialogWakeUp() {
-        if (!this._dialog || typeof this._dialog.wakeUpScreen !== 'function') return;
-        this._origWakeUpScreen = this._dialog.wakeUpScreen.bind(this._dialog);
-        const self = this;
-        this._dialog.wakeUpScreen = function () {
-            self._inAuthMode = true;
-            self._syncOverlayVisibility();
-            self._origWakeUpScreen();
-        };
+    // Check if the lock screen is currently in password-entry (auth) mode.
+    // Tries several properties that may exist depending on the GNOME Shell version.
+    _detectAuthMode() {
+        const d = this._dialog;
+        if (!d) return false;
+        // Primary indicator: auth prompt actor is mapped (on-screen and visible)
+        if (d._authPrompt) return d._authPrompt.mapped;
+        // Fallback: user widget (avatar) is visible
+        if (d._userWidget) return d._userWidget.mapped;
+        // Fallback: if clock/date group is hidden, we're in auth mode
+        if (d._clockGroup) return !d._clockGroup.visible;
+        return false;
     }
 
-    // Patch shield._resetLockScreen to detect when auth mode ends (back to idle)
-    // and, when unblank is enabled, to skip the fade-to-black.
+    // Patch Main.screenShield._activateFade to prevent lock screen blanking.
+    // Patch _resetLockScreen to skip the fade-to-black animation.
     _patchShield() {
         const shield = Main.screenShield;
+
         const doUnblank = this._settings.get_boolean('unblank-enabled') &&
                           (!this._settings.get_boolean('unblank-ac-only') || this._isOnAC());
 
-        // Always patch _resetLockScreen so we can detect auth-mode reset
-        this._origResetLockScreen = shield._resetLockScreen.bind(shield);
-        const self = this;
-        shield._resetLockScreen = function (params) {
-            self._inAuthMode = false;
-            self._syncOverlayVisibility();
-            if (doUnblank)
-                self._origResetLockScreen.call(this, Object.assign({}, params, { fadeToBlack: false }));
-            else
-                self._origResetLockScreen.call(this, params);
-        };
+        if (doUnblank && typeof shield._activateFade === 'function') {
+            this._origActivateFade = shield._activateFade.bind(shield);
+            shield._activateFade = function (lightbox, time) {
+                // Skip the fade entirely when locked - screen stays lit
+                if (Main.sessionMode.currentMode === 'unlock-dialog') {
+                    if (this._becameActiveId === 0) {
+                        this._becameActiveId = this.idleMonitor.add_user_active_watch(
+                            this._onUserBecameActive.bind(this)
+                        );
+                    }
+                    return;
+                }
+                // Not locked: use original fade behavior
+                Main.uiGroup.set_child_above_sibling(lightbox, null);
+                lightbox.lightOn(time);
+                if (this._becameActiveId === 0) {
+                    this._becameActiveId = this.idleMonitor.add_user_active_watch(
+                        this._onUserBecameActive.bind(this)
+                    );
+                }
+            };
 
-        if (!doUnblank) return;
-
-        // Patch _activateFade: turn the lightbox on briefly then off to prevent blanking
-        this._origActivateFade = shield._activateFade.bind(shield);
-        shield._activateFade = function (lightbox, time) {
-            if (self._fadeDismissId) {
-                GLib.source_remove(self._fadeDismissId);
-                self._fadeDismissId = null;
-            }
-            Main.uiGroup.set_child_above_sibling(lightbox, null);
-            lightbox.lightOn(time);
-            self._fadeDismissId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, time + 500, () => {
-                lightbox.lightOff();
-                self._fadeDismissId = null;
-                return GLib.SOURCE_REMOVE;
-            });
-            if (this._becameActiveId === 0) {
-                this._becameActiveId = this.idleMonitor.add_user_active_watch(
-                    this._onUserBecameActive.bind(this)
+            const minutes = this._settings.get_int('unblank-timeout');
+            if (minutes > 0) {
+                this._unblankTimeoutId = GLib.timeout_add_seconds(
+                    GLib.PRIORITY_DEFAULT,
+                    minutes * 60,
+                    () => {
+                        this._unblankTimeoutId = null;
+                        this._unpatchActivateFade();
+                        return GLib.SOURCE_REMOVE;
+                    }
                 );
             }
-        };
+        }
 
-        // Optional re-blank timeout
-        const minutes = this._settings.get_int('unblank-timeout');
-        if (minutes > 0) {
-            this._unblankTimeoutId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, minutes * 60, () => {
-                this._unblankTimeoutId = null;
-                this._unpatchActivateFade();
-                return GLib.SOURCE_REMOVE;
-            });
+        if (typeof shield._resetLockScreen === 'function') {
+            this._origResetLockScreen = shield._resetLockScreen.bind(shield);
+            const self = this;
+            shield._resetLockScreen = function (params) {
+                // Returning from auth mode back to idle state
+                self._inAuthMode = false;
+                self._syncOverlayVisibility();
+                if (doUnblank)
+                    self._origResetLockScreen.call(this, Object.assign({}, params, { fadeToBlack: false }));
+                else
+                    self._origResetLockScreen.call(this, params);
+            };
         }
     }
 
     _unpatchActivateFade() {
-        if (this._fadeDismissId) {
-            GLib.source_remove(this._fadeDismissId);
-            this._fadeDismissId = null;
-        }
         if (this._origActivateFade) {
             Main.screenShield._activateFade = this._origActivateFade;
             this._origActivateFade = null;
@@ -254,7 +268,6 @@ export default class LockscreenControl extends Extension {
             this._toggleButton.hide();
         }
 
-        // When entering auth mode, restore notifications so layout stays intact
         if (this._inAuthMode) {
             const notifBox = this._dialog?._notificationsBox;
             if (notifBox) {
@@ -299,13 +312,8 @@ export default class LockscreenControl extends Extension {
         this._messageLabel.set_style(`font-size: ${size}px; color: ${color};`);
         const monitor = Main.layoutManager.primaryMonitor;
         if (monitor) {
-            // Force full monitor width so Pango centering applies across the whole screen
-            this._messageLabel.set_width(monitor.width);
-            // Place just below the date (~48% down matches the lock screen clock/date group)
-            this._messageLabel.set_position(
-                monitor.x,
-                monitor.y + Math.floor(monitor.height * 0.48)
-            );
+            // Only set y; x is handled by AlignConstraint
+            this._messageLabel.set_y(monitor.y + Math.floor(monitor.height * 0.48));
         }
         global.stage.set_child_above_sibling(this._messageLabel, null);
         this._syncOverlayVisibility();
@@ -315,7 +323,6 @@ export default class LockscreenControl extends Extension {
         if (!this._settings.get_boolean('notifications-collapse')) return;
         const notifBox = this._dialog?._notificationsBox;
         if (!notifBox) return;
-        // opacity:0 keeps the box in layout so the clock position never shifts
         notifBox.opacity = this._collapsed ? 0 : 255;
         notifBox.reactive = !this._collapsed;
     }
@@ -332,13 +339,11 @@ export default class LockscreenControl extends Extension {
     }
 
     _teardownLockScreen() {
-        // Restore dialog.wakeUpScreen
-        if (this._origWakeUpScreen && this._dialog) {
-            this._dialog.wakeUpScreen = this._origWakeUpScreen;
-            this._origWakeUpScreen = null;
+        if (this._authPollId) {
+            GLib.source_remove(this._authPollId);
+            this._authPollId = null;
         }
 
-        // Restore shield patches
         if (this._origResetLockScreen) {
             Main.screenShield._resetLockScreen = this._origResetLockScreen;
             this._origResetLockScreen = null;
@@ -348,6 +353,11 @@ export default class LockscreenControl extends Extension {
         if (this._unblankTimeoutId) {
             GLib.source_remove(this._unblankTimeoutId);
             this._unblankTimeoutId = null;
+        }
+
+        if (this._fadeDismissId) {
+            GLib.source_remove(this._fadeDismissId);
+            this._fadeDismissId = null;
         }
 
         this._dialog?.disconnectObject(this);
