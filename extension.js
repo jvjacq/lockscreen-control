@@ -14,6 +14,7 @@ export default class LockscreenControl extends Extension {
         this._collapsed = true;
         this._retryId = null;
         this._authPollId = null;
+        this._idleShowId = null;
         this._blurEffect = null;
         this._dimOverlay = null;
         this._messageLabel = null;
@@ -126,9 +127,22 @@ export default class LockscreenControl extends Extension {
         this._inAuthMode = this._detectAuthMode();
         this._authPollId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 300, () => {
             const nowInAuth = this._detectAuthMode();
-            if (nowInAuth !== this._inAuthMode) {
-                this._inAuthMode = nowInAuth;
+            if (nowInAuth && !this._inAuthMode) {
+                // Entering auth: hide our UI immediately
+                if (this._idleShowId) {
+                    GLib.source_remove(this._idleShowId);
+                    this._idleShowId = null;
+                }
+                this._inAuthMode = true;
                 this._syncOverlayVisibility();
+            } else if (!nowInAuth && this._inAuthMode && !this._idleShowId) {
+                // Exiting auth: delay before showing so GNOME's exit animation finishes
+                this._idleShowId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 600, () => {
+                    this._idleShowId = null;
+                    this._inAuthMode = false;
+                    this._syncOverlayVisibility();
+                    return GLib.SOURCE_REMOVE;
+                });
             }
             return GLib.SOURCE_CONTINUE;
         });
@@ -342,6 +356,10 @@ export default class LockscreenControl extends Extension {
         if (this._authPollId) {
             GLib.source_remove(this._authPollId);
             this._authPollId = null;
+        }
+        if (this._idleShowId) {
+            GLib.source_remove(this._idleShowId);
+            this._idleShowId = null;
         }
 
         if (this._origResetLockScreen) {
