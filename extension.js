@@ -186,18 +186,21 @@ export default class LockscreenControl extends Extension {
         return false;
     }
 
-    // Patch Main.screenShield._activateFade to prevent lock screen blanking.
-    // Patch _resetLockScreen to skip the fade-to-black animation.
+    // Patch Main.screenShield methods to prevent lock screen blanking.
+    // Auth mode detection is handled entirely by the poll — no auth logic here.
     _patchShield() {
         const shield = Main.screenShield;
+        const self = this;
 
         const doUnblank = this._settings.get_boolean('unblank-enabled') &&
                           (!this._settings.get_boolean('unblank-ac-only') || this._isOnAC());
 
-        if (doUnblank && typeof shield._activateFade === 'function') {
+        if (!doUnblank) return;
+
+        if (typeof shield._activateFade === 'function') {
             this._origActivateFade = shield._activateFade.bind(shield);
             shield._activateFade = function (lightbox, time) {
-                // Skip the fade entirely when locked - screen stays lit
+                // Skip the fade entirely when locked so the screen stays lit
                 if (Main.sessionMode.currentMode === 'unlock-dialog') {
                     if (this._becameActiveId === 0) {
                         this._becameActiveId = this.idleMonitor.add_user_active_watch(
@@ -206,7 +209,6 @@ export default class LockscreenControl extends Extension {
                     }
                     return;
                 }
-                // Not locked: use original fade behavior
                 Main.uiGroup.set_child_above_sibling(lightbox, null);
                 lightbox.lightOn(time);
                 if (this._becameActiveId === 0) {
@@ -215,33 +217,26 @@ export default class LockscreenControl extends Extension {
                     );
                 }
             };
-
-            const minutes = this._settings.get_int('unblank-timeout');
-            if (minutes > 0) {
-                this._unblankTimeoutId = GLib.timeout_add_seconds(
-                    GLib.PRIORITY_DEFAULT,
-                    minutes * 60,
-                    () => {
-                        this._unblankTimeoutId = null;
-                        this._unpatchActivateFade();
-                        return GLib.SOURCE_REMOVE;
-                    }
-                );
-            }
         }
 
         if (typeof shield._resetLockScreen === 'function') {
             this._origResetLockScreen = shield._resetLockScreen.bind(shield);
-            const self = this;
             shield._resetLockScreen = function (params) {
-                // Returning from auth mode back to idle state
-                self._inAuthMode = false;
-                self._syncOverlayVisibility();
-                if (doUnblank)
-                    self._origResetLockScreen.call(this, Object.assign({}, params, { fadeToBlack: false }));
-                else
-                    self._origResetLockScreen.call(this, params);
+                self._origResetLockScreen.call(this, Object.assign({}, params, { fadeToBlack: false }));
             };
+        }
+
+        const minutes = this._settings.get_int('unblank-timeout');
+        if (minutes > 0) {
+            this._unblankTimeoutId = GLib.timeout_add_seconds(
+                GLib.PRIORITY_DEFAULT,
+                minutes * 60,
+                () => {
+                    this._unblankTimeoutId = null;
+                    this._unpatchActivateFade();
+                    return GLib.SOURCE_REMOVE;
+                }
+            );
         }
     }
 
