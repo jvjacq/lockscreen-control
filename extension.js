@@ -111,14 +111,15 @@ export default class LockscreenControl extends Extension {
 
         if (monitor) {
             this._messageLabel = new St.Label({ reactive: false, can_focus: false });
-            // AlignConstraint centers the actor on the x-axis relative to the stage,
-            // correctly accounting for the actor's actual rendered width.
             this._messageLabel.add_constraint(new Clutter.AlignConstraint({
                 source: global.stage,
                 align_axis: Clutter.AlignAxis.X_AXIS,
                 factor: 0.5,
             }));
             global.stage.add_child(this._messageLabel);
+            // Reposition once the dialog finishes its first layout pass, so we
+            // can read the clock group's actual on-screen position.
+            this._dialog.connectObject('notify::allocation', () => this._positionMessage(), this);
             this._syncMessage();
         }
 
@@ -336,13 +337,28 @@ export default class LockscreenControl extends Extension {
         const color = this._settings.get_string('message-color');
         this._messageLabel.set_text(text);
         this._messageLabel.set_style(`font-size: ${size}px; color: ${color};`);
-        const monitor = Main.layoutManager.primaryMonitor;
-        if (monitor) {
-            // Only set y; x is handled by AlignConstraint
-            this._messageLabel.set_y(monitor.y + Math.floor(monitor.height * 0.48));
-        }
+        this._positionMessage();
         global.stage.set_child_above_sibling(this._messageLabel, null);
         this._syncOverlayVisibility();
+    }
+
+    _positionMessage() {
+        if (!this._messageLabel) return;
+        const monitor = Main.layoutManager.primaryMonitor;
+        if (!monitor) return;
+
+        // Prefer anchoring below the clock/date group so the label clears it on
+        // any resolution. Falls back to a safe percentage if the dialog hasn't
+        // laid out yet or the clock group isn't accessible.
+        const clockGroup = this._dialog?._clockGroup;
+        if (clockGroup && clockGroup.height > 10) {
+            const [, cy] = clockGroup.get_transformed_position();
+            if (cy > 10) {
+                this._messageLabel.set_y(cy + clockGroup.height + 24);
+                return;
+            }
+        }
+        this._messageLabel.set_y(monitor.y + Math.floor(monitor.height * 0.55));
     }
 
     _syncNotifBox() {
